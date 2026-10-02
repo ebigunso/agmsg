@@ -45,6 +45,8 @@ struct PtySession {
     /// (text-A text-B Enter Enter submits a mangled line, then an Enter on
     /// an empty composer).
     inject_lock: Arc<Mutex<()>>,
+    /// pty_inject sends codex (and only codex) a Right-arrow before Enter.
+    is_codex: bool,
 }
 
 /// All live sessions, keyed by a frontend-chosen id (e.g. "claude-1").
@@ -215,6 +217,7 @@ pub fn pty_spawn(
         .and_then(|name| name.to_str())
         .unwrap_or(&cmd)
         .to_ascii_lowercase();
+    let is_codex = agent_type == "codex";
     let detection = Arc::new(Mutex::new(DetectionTracker::new(agent_type)));
 
     // Reader thread: stream output to the webview.
@@ -250,6 +253,7 @@ pub fn pty_spawn(
             tail,
             detection,
             inject_lock: Arc::new(Mutex::new(())),
+            is_codex,
         },
     );
     Ok(())
@@ -329,11 +333,17 @@ pub fn pty_kill(manager: State<'_, PtyManager>, id: String) -> Result<(), String
 /// buffer and clears the suppression window before handling the key
 /// (`flush_before_modified_input` + `clear_window_after_non_char`), after
 /// which Enter submits normally — even when the whole sequence arrives in
-/// one batched read. So the sequence is text → gap → Right-arrow → Enter:
-/// 11/11 submitted across stalled / loaded / single-batch reproductions
-/// where the old sequence went 0-for-all. A Right-arrow at the end of the
-/// composer text is a cursor no-op in every TUI this app spawns. The gap
-/// stays as typed-input pacing for other agents.
+/// one batched read. So for a codex pane the sequence is text → gap →
+/// Right-arrow → Enter: 11/11 submitted across stalled / loaded /
+/// single-batch reproductions where the old sequence went 0-for-all.
+///
+/// Codex ONLY — every other pane type keeps the previous text → gap → Enter.
+/// The arrow is not a no-op everywhere: a shell or REPL without line editing
+/// takes it as literal input (`bash --noediting` submits `PROBE\x1b[C`), and
+/// in fish a Right-arrow at end of line accepts the autosuggestion, so the
+/// Enter could run a history completion appended to the injected line. It
+/// was measured on codex and exists for codex's paste heuristic; nothing
+/// else gets it.
 ///
 /// Deliberately fire-and-forget after that, same as before: there is no
 /// post-submit verification or retry. The pane state can't prove "our text
@@ -350,11 +360,15 @@ pub fn pty_inject(manager: State<'_, PtyManager>, id: String, text: String) -> R
     let sessions = Arc::clone(&manager.sessions);
     thread::spawn(move || {
         // One injection at a time per pane; a second message must not
-        // interleave its writes with this one's text/arrow/Enter sequence
+        // interleave its writes with this one's text/Enter sequence
         // (text-A text-B Enter Enter submits a mangled line). Clone the lock
         // handle out so the sessions map isn't held across the sleeps
         // (pty_write/pty_kill must stay responsive). Held ~350ms.
-        let Some(lock) = sessions.lock().unwrap().get(&id).map(|s| Arc::clone(&s.inject_lock))
+        let Some((lock, is_codex)) = sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| (Arc::clone(&s.inject_lock), s.is_codex))
         else {
             return;
         };
@@ -368,8 +382,10 @@ pub fn pty_inject(manager: State<'_, PtyManager>, id: String, text: String) -> R
         };
         write(text.as_bytes());
         thread::sleep(Duration::from_millis(300));
-        write(b"\x1b[C");
-        thread::sleep(Duration::from_millis(50));
+        if is_codex {
+            write(b"\x1b[C");
+            thread::sleep(Duration::from_millis(50));
+        }
         write(b"\r");
     });
     Ok(())
